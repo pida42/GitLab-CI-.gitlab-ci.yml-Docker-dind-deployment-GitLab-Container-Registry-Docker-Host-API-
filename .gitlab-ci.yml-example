@@ -1,0 +1,110 @@
+# Maintainer: Frantisek Preissler, pida42 <github@ntisek.cz>
+
+# --- Default varibles for the job -------------------------------------------------------
+.variables: &global_variables
+
+  SERVER_NAME: docker1.aws.server.tld
+
+  HOST_DEV: dev.${SERVER_NAME}
+  HOST_STAGE: stage.${SERVER_NAME}
+  HOST_PROD: prod.${SERVER_NAME}
+
+  DEBUG: "true"
+  DOCKER_DEBUG: "true"
+
+  DOCKER_TLS_CERTDIR: ""
+
+  # https://docs.docker.com/develop/develop-images/build_enhancements/#to-enable-buildkit-builds
+  DOCKER_BUILDKIT: 1
+
+  # https://docs.docker.com/compose/reference/envvars/#compose_docker_cli_build
+  COMPOSE_DOCKER_CLI_BUILD: 1
+
+# --- Runner ----------------------------------------------------------------------------
+image: docker:19.03.13
+
+services:
+  - docker:19.03.13-dind
+
+# --- Stages and their definitions ------------------------------------------------------
+stages:
+  - docker-build
+  - docker-deploy
+
+before_script:
+  - docker login -u gitlab-ci-token -p ${CI_JOB_TOKEN} ${CI_REGISTRY}
+
+# 1. build
+.build: &build
+  stage: docker-build
+  script:
+    - docker pull jboss/keycloak
+    - docker tag jboss/keycloak:latest ${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHORT_SHA}
+    - docker tag ${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHORT_SHA} ${CI_REGISTRY_IMAGE}:latest
+    - docker push ${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHORT_SHA}
+    - docker push ${CI_REGISTRY_IMAGE}:latest
+
+# 2. deploy
+.deploy: &deploy
+  stage: docker-deploy
+  before_script:
+    - apk add docker-compose
+    - docker login -u gitlab-ci-token -p ${CI_JOB_TOKEN} ${CI_REGISTRY}
+    - mkdir -p /root/.docker
+    - cp ${DOCKER_CACERT} /root/.docker/ca.pem && cp ${DOCKER_CERT} /root/.docker/cert.pem && cp ${DOCKER_KEY} /root/.docker/key.pem && chmod 444 /root/.docker/key.pem
+    - export DOCKER_HOST=tcp://${SERVER_NAME}:2376 DOCKER_TLS_VERIFY=1 DOCKER_CERT_PATH=/root/.docker
+  script:
+    - docker-compose -p "${CI_PROJECT_TITLE}" down --remove-orphans
+    - docker system prune --all --volumes --force
+    - docker-compose -p "${CI_PROJECT_TITLE}" up -d --build && docker-compose logs --tail=250
+
+# --- Job template ------------------------------------------------------------
+
+.job_defs: &job_template
+  variables:
+    <<: *global_variables
+
+.job_config-dev:
+  <<: *job_template
+  only:
+    - develop
+  environment:
+    name: Development
+    url: https://${HOST_DEV}
+
+.job_config-stage:
+  <<: *job_template
+  only:
+    - stage
+  when: manual
+  environment:
+    name: Staging
+    url: https://${HOST_STAGE}
+
+.job_config-prod:
+  <<: *job_template
+  only:
+    - master
+  when: manual
+  environment:
+    name: Production
+    url: https://${HOST_PROD}
+
+# --- Build Instance ----------------------------------------------------------
+
+## docker1.aws.server.tld - dev
+Build Docker Images:
+  <<: *build
+  extends: .job_config-dev
+
+Deploy Dev:
+  <<: *deploy
+  extends: .job_config-dev
+
+Deploy Stage:
+  <<: *deploy
+  extends: .job_config-stage
+
+Deploy Prod:
+  <<: *deploy
+  extends: .job_config-prod
